@@ -2,47 +2,90 @@ package goproxy
 
 import (
 	"net"
+	"sync"
 
 	tls "github.com/refraction-networking/utls"
 )
 
-// capturingConn wraps a net.Conn and captures the first TLS record (ClientHello) seen when reading
-type capturingConn struct {
+const (
+	_tlsRecordTypeHandshake uint8 = 0x16
+	_tlsHandshakeClientHello uint8 = 0x01
+)
+
+// clientHelloCaptureConn wraps a net.Conn and captures the raw ClientHello
+// message during the TLS handshake. It does NOT consume bytes — it copies
+// them as they pass through Read().
+type clientHelloCaptureConn struct {
 	net.Conn
-	captured      bool
-	capturedBytes []byte
-	onCapture     func([]byte)
+
+	mu             sync.Mutex
+	capturing      bool
+	captured       bool
+	buf            []byte
+	clientHello    []byte
 }
 
-// Read intercepts the connection read to capture the ClientHello
-// Important: We capture the bytes for fingerprinting but still return them to the caller
-func (c *capturingConn) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
-	
-	if !c.captured && n > 0 {
-		// Capture the data seen on first read if it's a TLS handshake record (type 0x16)
-		if b[0] == 0x16 { // TLS handshake record type
-			// Store a copy of the captured bytes for fingerprinting
-			c.capturedBytes = make([]byte, n)
-			copy(c.capturedBytes, b[:n])
-			c.captured = true
-			if c.onCapture != nil {
-				c.onCapture(c.capturedBytes)
-			}
-		}
+func newClientHelloCaptureConn(c net.Conn) *clientHelloCaptureConn {
+	return &clientHelloCaptureConn{
+		Conn:      c,
+		capturing: true,
 	}
-	
-	// Always return the full data to the caller - we only captured for fingerprinting
+}
+
+func (c *clientHelloCaptureConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.mu.Lock()
+		if c.capturing && !c.captured {
+			c.buf = append(c.buf, b[:n]...)
+			c.tryExtractClientHello()
+		}
+		c.mu.Unlock()
+	}
 	return n, err
 }
 
-// wrapConnToCapture creates a connection wrapper that captures the ClientHello bytes
-// The wrapper transparently forwards all operations while capturing the first TLS record
-func wrapConnToCapture(conn net.Conn, onCapture func([]byte)) net.Conn {
-	return &capturingConn{
-		Conn:      conn,
-		onCapture: onCapture,
+func (c *clientHelloCaptureConn) tryExtractClientHello() {
+	buf := c.buf
+
+	// Need at least 5 bytes for TLS record header
+	if len(buf) < 5 {
+		return
 	}
+
+	// Check: TLS record type = Handshake (0x16)
+	if buf[0] != _tlsRecordTypeHandshake {
+		c.capturing = false
+		return
+	}
+
+	// TLS record length (bytes 3-4, big endian)
+	recordLen := int(buf[3])<<8 | int(buf[4])
+	totalLen := 5 + recordLen
+
+	// Wait until we have the full record
+	if len(buf) < totalLen {
+		return
+	}
+
+	// Check: Handshake type = ClientHello (0x01) at byte 5
+	if len(buf) > 5 && buf[5] != _tlsHandshakeClientHello {
+		c.capturing = false
+		return
+	}
+
+	// We have the complete ClientHello record
+	c.clientHello = make([]byte, totalLen)
+	copy(c.clientHello, buf[:totalLen])
+	c.captured = true
+	c.capturing = false
+}
+
+// ClientHelloBytes returns the captured raw ClientHello or nil if not captured.
+func (c *clientHelloCaptureConn) ClientHelloBytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.clientHello
 }
 
 // fingerprintClientHello extracts and fingerprints a ClientHello from raw bytes

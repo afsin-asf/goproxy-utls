@@ -50,13 +50,6 @@ func (f RoundTripperFunc) RoundTrip(req *http.Request, ctx *ProxyCtx) (*http.Res
 	return f(req, ctx)
 }
 
-func (ctx *ProxyCtx) RoundTrip(req *http.Request) (*http.Response, error) {
-	if ctx.RoundTripper != nil {
-		return ctx.RoundTripper.RoundTrip(req, ctx)
-	}
-	return ctx.Proxy.Tr.RoundTrip(req)
-}
-
 func (ctx *ProxyCtx) printf(msg string, argv ...any) {
 	ctx.Proxy.Logger.Printf("[%03d] "+msg+"\n", append([]any{ctx.Session & 0xFFFF}, argv...)...)
 }

@@ -42,7 +42,6 @@ var (
 
 var _errorRespMaxLength int64 = 500
 
-const _tlsRecordTypeHandshake = byte(22)
 
 type readBufferedConn struct {
 	net.Conn
@@ -121,7 +120,12 @@ type halfClosable interface {
 var _ halfClosable = (*net.TCPConn)(nil)
 
 func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request) {
-	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), Proxy: proxy, certStore: proxy.CertStore}
+	ctx := &ProxyCtx{
+		Req:       r,
+		Session:   atomic.AddInt64(&proxy.sess, 1),
+		Proxy:     proxy,
+		certStore: proxy.CertStore,
+	}
 
 	hij, ok := w.(http.Hijacker)
 	if !ok {
@@ -137,14 +141,13 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 	todo, host := OkConnect, r.URL.Host
 	for i, h := range proxy.httpsHandlers {
 		newtodo, newhost := h.HandleConnect(host, ctx)
-
-		// If found a result, break the loop immediately
 		if newtodo != nil {
 			todo, host = newtodo, newhost
 			ctx.Logf("on %dth handler: %v %s", i, todo, host)
 			break
 		}
 	}
+
 	switch todo.Action {
 	case ConnectAccept:
 		if !hasPort.MatchString(host) {
@@ -168,29 +171,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				go copyAndClose(ctx, targetTCP, proxyClientTCP, &wg)
 				go copyAndClose(ctx, proxyClientTCP, targetTCP, &wg)
 				wg.Wait()
-				// Make sure to close the underlying TCP socket.
-				// CloseRead() and CloseWrite() keep it open until its timeout,
-				// causing error when there are thousands of requests.
 				proxyClientTCP.Close()
 				targetTCP.Close()
 			}()
 		} else {
-			// There is a race with the runtime here. In the case where the
-			// connection to the target site times out, we cannot control which
-			// io.Copy loop will receive the timeout signal first. This means
-			// that in some cases the error passed to the ConnErrorHandler will
-			// be the timeout error, and in other cases it will be an error raised
-			// by the use of a closed network connection.
-			//
-			// 2020/05/28 23:42:17 [001] WARN: Error copying to client: read tcp 127.0.0.1:33742->127.0.0.1:34763: i/o timeout
-			// 2020/05/28 23:42:17 [001] WARN: Error copying to client: read tcp 127.0.0.1:45145->127.0.0.1:60494: use of closed
-			//                                                          network connection
-			//
-			// It's also not possible to synchronize these connection closures due to
-			// TCP connections which are half-closed. When this happens, only the one
-			// side of the connection breaks out of its io.Copy loop. The other side
-			// of the connection remains open until it either times out or is reset by
-			// the client.
 			go func() {
 				err := copyOrWarn(ctx, targetSiteCon, proxyClient)
 				if err != nil && proxy.ConnectionErrHandler != nil {
@@ -198,7 +182,6 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				}
 				_ = targetSiteCon.Close()
 			}()
-
 			go func() {
 				_ = copyOrWarn(ctx, proxyClient, targetSiteCon)
 				_ = proxyClient.Close()
@@ -207,196 +190,172 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 
 	case ConnectHijack:
 		todo.Hijack(r, proxyClient, ctx)
-		case ConnectHTTPMitm, ConnectMitm:
-			_, _ = proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
-			ctx.Logf("Received CONNECT request, mitm proxying it")
-			// this goes in a separate goroutine, so that the net/http server won't think we're
-			// still handling the request even after hijacking the connection. Those HTTP CONNECT
-			// request can take forever, and the server will be stuck when "closed".
-			// TODO: Allow Server.Close() mechanism to shut down this connection as nicely as possible
-			go func() {
-				// Check if this is an HTTP or an HTTPS MITM request
-				readBuffer := bufio.NewReader(proxyClient)
-				peek, _ := readBuffer.Peek(1)
-			isTLS := len(peek) > 0 && peek[0] == _tlsRecordTypeHandshake
 
-			var client net.Conn = &readBufferedConn{Conn: proxyClient, r: readBuffer}
-			defer func() {
-				_ = client.Close()
-			}()
+	case ConnectHTTPMitm, ConnectMitm:
+		_, _ = proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
+		ctx.Logf("Received CONNECT request, mitm proxying it")
 
-			var tlsConfig *tls.Config
-			scheme := "http"
-			if isTLS {
-				scheme = "https"
-				tlsConfig = defaultTLSConfig
-				if todo.TLSConfig != nil {
-					var err error
-					tlsConfig, err = todo.TLSConfig(host, ctx)
-					if err != nil {
-						httpError(proxyClient, ctx, err)
-						return
-					}
-				}
+go func() {
+    readBuffer := bufio.NewReader(proxyClient)
+    peek, _ := readBuffer.Peek(1)
+    isTLS := len(peek) > 0 && peek[0] == _tlsRecordTypeHandshake
 
-				// Wrap the connection to capture raw ClientHello bytes for fingerprinting
-				client = wrapConnToCapture(client, func(rawBytes []byte) {
-					ctx.RawClientHello = rawBytes
-					// Fingerprint the captured ClientHello
-					spec := fingerprintClientHello(rawBytes)
-					if spec != nil {
-						ctx.ClientHelloSpec = spec
-						ctx.Logf("Captured ClientHello fingerprint from incoming connection")
-					} else {
-						ctx.Logf("Could not fingerprint ClientHello, will use default Chrome")
-					}
-				})
+    var capturedHelloSpec *tls.ClientHelloSpec
+    var capturedRawHello []byte
 
-				// Create a TLS connection over the TCP connection
-				rawClientTls := tls.Server(client, tlsConfig)
-				client = rawClientTls
-				if err := rawClientTls.HandshakeContext(context.Background()); err != nil {
-					ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
-					return
-				}
-			}
+    var tlsConfig *tls.Config
+    scheme := "http"
+    fingerprinter := &tls.Fingerprinter{}
+    var client net.Conn
+
+    if isTLS {
+        scheme = "https"
+        tlsConfig = defaultTLSConfig
+        if todo.TLSConfig != nil {
+            var err error
+            tlsConfig, err = todo.TLSConfig(host, ctx)
+            if err != nil {
+                httpError(proxyClient, ctx, err)
+                return
+            }
+        }
+
+        // ✅ FIX: readBuffer'ı içeren conn'u kullan, raw proxyClient'ı değil!
+        bufferedConn := &readBufferedConn{Conn: proxyClient, r: readBuffer}
+        captureConn := newClientHelloCaptureConn(bufferedConn)
+
+        rawClientTls := tls.Server(captureConn, tlsConfig)
+        if err := rawClientTls.HandshakeContext(context.Background()); err != nil {
+            ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
+            return
+        }
+
+        capturedRawHello = captureConn.ClientHelloBytes()
+        if capturedRawHello != nil {
+            spec, err := fingerprinter.FingerprintClientHello(capturedRawHello)
+            if err == nil {
+                capturedHelloSpec = spec
+                ctx.Logf("Captured ClientHello fingerprint (%d bytes)", len(capturedRawHello))
+            } else {
+                ctx.Warnf("Failed to fingerprint ClientHello: %v", err)
+            }
+        }
+
+        client = rawClientTls
+    } else {
+        client = &readBufferedConn{Conn: proxyClient, r: readBuffer}
+    }
+
+    defer func() {
+        _ = client.Close()
+    }()
 
 			clientReader := http1parser.NewRequestReader(proxy.PreventCanonicalization, client)
 			for !clientReader.IsEOF() {
 				req, err := clientReader.ReadRequest()
-				ctx := &ProxyCtx{
-					Req:          req,
-					Session:      atomic.AddInt64(&proxy.sess, 1),
-					Proxy:        proxy,
-					UserData:     ctx.UserData,
-					RoundTripper: ctx.RoundTripper,
+				// Create per-request context but carry over fingerprint
+				reqCtx := &ProxyCtx{
+					Req:             req,
+					Session:         atomic.AddInt64(&proxy.sess, 1),
+					Proxy:           proxy,
+					UserData:        ctx.UserData,
+					RoundTripper:    ctx.RoundTripper,
+					ClientHelloSpec: capturedHelloSpec,
+					RawClientHello:  capturedRawHello,
 				}
 				if err != nil && !errors.Is(err, io.EOF) {
-					ctx.Warnf("Cannot read request from mitm'd client %v %v", r.Host, err)
+					reqCtx.Warnf("Cannot read request from mitm'd client %v %v", r.Host, err)
 				}
 				if err != nil {
 					return
 				}
 
-				// since we're converting the request, need to carry over the
-				// original connecting IP as well
 				req.RemoteAddr = r.RemoteAddr
-				ctx.Logf("req %v", r.Host)
+				reqCtx.Logf("req %v", r.Host)
 
 				if !strings.HasPrefix(req.URL.String(), scheme+"://") {
 					req.URL, err = url.Parse(scheme + "://" + r.Host + req.URL.String())
 				}
 
 				if continueLoop := func(req *http.Request) bool {
-					// Since we handled the request parsing by our own, we manually
-					// need to set a cancellable context when we finished the request
-					// processing (same behaviour of the stdlib)
 					requestContext, finishRequest := context.WithCancel(req.Context())
 					req = req.WithContext(requestContext)
 					defer finishRequest()
-
-					// explicitly discard request body to avoid data races in certain RoundTripper implementations
-					// see https://github.com/golang/go/issues/61596#issuecomment-1652345131
 					defer req.Body.Close()
 
-					// Bug fix which goproxy fails to provide request
-					// information URL in the context when does HTTPS MITM
-					ctx.Req = req
+					reqCtx.Req = req
 
-					req, resp := proxy.filterRequest(req, ctx)
+					req, resp := proxy.filterRequest(req, reqCtx)
 					if resp == nil {
 						if req.Method == "PRI" {
-							// Handle HTTP/2 connections.
-
-							// NOTE: As of 1.22, golang's http module will not recognize or
-							// parse the HTTP Body for PRI requests. This leaves the body of
-							// the http2.ClientPreface ("SM\r\n\r\n") on the wire which we need
-							// to clear before setting up the connection.
 							reader := clientReader.Reader()
 							_, err := reader.Discard(6)
 							if err != nil {
-								ctx.Warnf("Failed to process HTTP2 client preface: %v", err)
+								reqCtx.Warnf("Failed to process HTTP2 client preface: %v", err)
 								return false
 							}
 							if !proxy.AllowHTTP2 {
-								ctx.Warnf("HTTP2 connection failed: disallowed")
+								reqCtx.Warnf("HTTP2 connection failed: disallowed")
 								return false
 							}
 							tr := H2Transport{reader, client, tlsConfig, host}
 							if _, err := tr.RoundTrip(req); err != nil {
-								ctx.Warnf("HTTP2 connection failed: %v", err)
+								reqCtx.Warnf("HTTP2 connection failed: %v", err)
 							} else {
-								ctx.Logf("Exiting on EOF")
+								reqCtx.Logf("Exiting on EOF")
 							}
 							return false
 						}
 						if err != nil {
 							if req.URL != nil {
-								ctx.Warnf("Illegal URL %s", scheme+"://"+r.Host+req.URL.Path)
+								reqCtx.Warnf("Illegal URL %s", scheme+"://"+r.Host+req.URL.Path)
 							} else {
-								ctx.Warnf("Illegal URL %s", scheme+"://"+r.Host)
+								reqCtx.Warnf("Illegal URL %s", scheme+"://"+r.Host)
 							}
 							return false
 						}
 						if !proxy.KeepHeader {
-							RemoveProxyHeaders(ctx, req)
+							RemoveProxyHeaders(reqCtx, req)
 						}
-						resp, err = ctx.RoundTrip(req)
+						resp, err = reqCtx.RoundTrip(req)
 						if err != nil {
-							ctx.Warnf("Cannot read response from mitm'd server %v", err)
+							reqCtx.Warnf("Cannot read response from mitm'd server %v", err)
 							return false
 						}
-						ctx.Logf("resp %v", resp.Status)
+						reqCtx.Logf("resp %v", resp.Status)
 					}
 					origBody := resp.Body
-					resp = proxy.filterResponse(resp, ctx)
+					resp = proxy.filterResponse(resp, reqCtx)
 					bodyModified := resp.Body != origBody
 					defer resp.Body.Close()
 					if bodyModified || (resp.ContentLength <= 0 && resp.Header.Get("Content-Length") == "") {
-						// Return chunked encoded response when we don't know the length of the resp, if the body
-						// has been modified by the response handler or if there is no content length in the response.
-						// We include 0 in resp.ContentLength <= 0 because 0 is the field zero value and some user
-						// might incorrectly leave it instead of setting it to -1 when the length is unknown (but we
-						// also check that the Content-Length header is empty, so there is no issue with empty bodies).
 						resp.ContentLength = -1
 						resp.Header.Del("Content-Length")
 						resp.TransferEncoding = []string{"chunked"}
 					}
 
-					// The MITM'd client speaks HTTP/1.1, but the upstream
-					// response may have been received over HTTP/2. Normalize
-					// the protocol version so resp.Write() produces a valid
-					// HTTP/1.1 status line.
 					resp.Proto = "HTTP/1.1"
 					resp.ProtoMajor = 1
 					resp.ProtoMinor = 1
 
 					if isWebSocketHandshake(resp.Header) {
-						ctx.Logf("Response looks like websocket upgrade.")
-
-						// According to resp.Body documentation:
-						// As of Go 1.12, the Body will also implement io.Writer
-						// on a successful "101 Switching Protocols" response,
-						// as used by WebSockets and HTTP/2's "h2c" mode.
+						reqCtx.Logf("Response looks like websocket upgrade.")
 						wsConn, ok := resp.Body.(io.ReadWriter)
 						if !ok {
-							ctx.Warnf("Unable to use Websocket connection")
+							reqCtx.Warnf("Unable to use Websocket connection")
 							return false
 						}
-						// Set Body to nil so resp.Write only writes the headers
-						// and returns immediately without blocking on the body
-						// (or else we wouldn't be able to proxy WebSocket data).
 						resp.Body = nil
 						if err := resp.Write(client); err != nil {
-							ctx.Warnf("Cannot write response header from mitm'd client: %v", err)
+							reqCtx.Warnf("Cannot write response header from mitm'd client: %v", err)
 							return false
 						}
-						proxy.proxyWebsocket(ctx, wsConn, client)
+						proxy.proxyWebsocket(reqCtx, wsConn, client)
 						return false
 					}
 
 					if err := resp.Write(client); err != nil {
-						ctx.Warnf("Cannot write response from mitm'd client: %v", err)
+						reqCtx.Warnf("Cannot write response from mitm'd client: %v", err)
 						return false
 					}
 
@@ -410,6 +369,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 	case ConnectProxyAuthHijack:
 		_, _ = proxyClient.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n"))
 		todo.Hijack(r, proxyClient, ctx)
+
 	case ConnectReject:
 		if ctx.Resp != nil {
 			if err := ctx.Resp.Write(proxyClient); err != nil {
