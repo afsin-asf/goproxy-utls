@@ -7,7 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/tls"
+	utls "github.com/refraction-networking/utls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
@@ -31,7 +31,7 @@ func hashSorted(lst []string) []byte {
 	return h.Sum(nil)
 }
 
-func SignHost(ca tls.Certificate, hosts []string) (cert *tls.Certificate, err error) {
+func SignHost(ca utls.Certificate, hosts []string) (cert *utls.Certificate, err error) {
 	// Use the provided CA for certificate generation.
 	// Use already parsed Leaf certificate when present.
 	x509ca := ca.Leaf
@@ -114,7 +114,7 @@ func SignHost(ca tls.Certificate, hosts []string) (cert *tls.Certificate, err er
 		certBytes[i+1] = singleCertBytes
 	}
 
-	return &tls.Certificate{
+	return &utls.Certificate{
 		Certificate: certBytes,
 		PrivateKey:  certpriv,
 		Leaf:        leafCert,

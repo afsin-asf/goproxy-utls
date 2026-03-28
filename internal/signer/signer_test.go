@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	utlstls "github.com/refraction-networking/utls"
+
 	"github.com/elazarl/goproxy"
 	"github.com/elazarl/goproxy/internal/signer"
 )
@@ -27,7 +29,7 @@ func (h ConstantHanlder) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	_, _ = io.WriteString(w, string(h))
 }
 
-func testSignerX509(t *testing.T, ca tls.Certificate) {
+func testSignerX509(t *testing.T, ca utlstls.Certificate) {
 	t.Helper()
 	cert, err := signer.SignHost(ca, []string{"example.com", "1.1.1.1", "localhost"})
 	orFatal(t, "singHost", err)
@@ -44,7 +46,7 @@ func testSignerX509(t *testing.T, ca tls.Certificate) {
 	orFatal(t, "Verify", err)
 }
 
-func testSignerTLS(t *testing.T, ca tls.Certificate) {
+func testSignerTLS(t *testing.T, ca utlstls.Certificate) {
 	t.Helper()
 	cert, err := signer.SignHost(ca, []string{"example.com", "1.1.1.1", "localhost"})
 	orFatal(t, "singHost", err)
@@ -53,8 +55,21 @@ func testSignerTLS(t *testing.T, ca tls.Certificate) {
 	expected := "key verifies with Go"
 	server := httptest.NewUnstartedServer(ConstantHanlder(expected))
 	defer server.Close()
+	
+	// Convert utlstls.Certificate back to crypto/tls.Certificate for httptest
+	cryptoCert := tls.Certificate{
+		Certificate: cert.Certificate,
+		PrivateKey:  cert.PrivateKey,
+		Leaf:        cert.Leaf,
+	}
+	cryptoCa := tls.Certificate{
+		Certificate: ca.Certificate,
+		PrivateKey:  ca.PrivateKey,
+		Leaf:        ca.Leaf,
+	}
+	
 	server.TLS = &tls.Config{
-		Certificates: []tls.Certificate{*cert, ca},
+		Certificates: []tls.Certificate{cryptoCert, cryptoCa},
 		MinVersion:   tls.VersionTLS12,
 	}
 	server.StartTLS()
@@ -92,7 +107,7 @@ func TestSignerEcdsaX509(t *testing.T) {
 }
 
 func BenchmarkSignRsa(b *testing.B) {
-	var cert *tls.Certificate
+	var cert *utlstls.Certificate
 	var err error
 	for n := 0; n < b.N; n++ {
 		cert, err = signer.SignHost(goproxy.GoproxyCa, []string{"example.com", "1.1.1.1", "localhost"})
@@ -102,7 +117,7 @@ func BenchmarkSignRsa(b *testing.B) {
 }
 
 func BenchmarkSignEcdsa(b *testing.B) {
-	var cert *tls.Certificate
+	var cert *utlstls.Certificate
 	var err error
 	for n := 0; n < b.N; n++ {
 		cert, err = signer.SignHost(EcdsaCa, []string{"example.com", "1.1.1.1", "localhost"})
@@ -136,11 +151,20 @@ qMgXe8ph4LtVu2VOUYhHttuEDsChRANCAAQ5R+GK3bpDxQI2zvMfoEfRfCA+3glP
 Dq4W2vzCG5Uka0VXnaY9PJSvtrL8qAHK3A7MpwpTvWkLbAvYr2fj5q9z
 -----END PRIVATE KEY-----`)
 
-var EcdsaCa, ecdsaCaErr = tls.X509KeyPair(EcdsaCaCert, EcdsaCaKey)
+var ecdsaCaTmp, ecdsaCaErr = tls.X509KeyPair(EcdsaCaCert, EcdsaCaKey)
+
+// EcdsaCa is converted to utlstls.Certificate for compatibility with SignHost
+var EcdsaCa utlstls.Certificate
 
 func init() {
 	if ecdsaCaErr != nil {
 		panic("Error parsing ecdsa CA " + ecdsaCaErr.Error())
+	}
+	// Convert from crypto/tls.Certificate to utlstls.Certificate
+	EcdsaCa = utlstls.Certificate{
+		Certificate: ecdsaCaTmp.Certificate,
+		PrivateKey:  ecdsaCaTmp.PrivateKey,
+		Leaf:        ecdsaCaTmp.Leaf,
 	}
 	var err error
 	if EcdsaCa.Leaf, err = x509.ParseCertificate(EcdsaCa.Certificate[0]); err != nil {

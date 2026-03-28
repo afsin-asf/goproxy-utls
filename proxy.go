@@ -3,6 +3,7 @@ package goproxy
 import (
 	"io"
 	"log"
+	tls "github.com/refraction-networking/utls"
 	"net"
 	"net/http"
 	"os"
@@ -24,6 +25,8 @@ type ProxyHttpServer struct {
 	respHandlers    []RespHandler
 	httpsHandlers   []HttpsHandler
 	Tr              *http.Transport
+	// TLSClientConfig for upstream connections (utls for fingerprinting resistance)
+	TLSClientConfig *tls.Config
 	// ConnectionErrHandler will be invoked to return a custom response
 	// to clients (written using conn parameter), when goproxy fails to connect
 	// to a target proxy.
@@ -149,7 +152,8 @@ func NewProxyHttpServer() *ProxyHttpServer {
 		NonproxyHandler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "This is a proxy server. Does not respond to non-proxy requests.", http.StatusInternalServerError)
 		}),
-		Tr: &http.Transport{TLSClientConfig: tlsClientSkipVerify, Proxy: http.ProxyFromEnvironment},
+		Tr: &http.Transport{Proxy: http.ProxyFromEnvironment},
+		TLSClientConfig: tlsClientSkipVerify,
 	}
 	proxy.ConnectDial = dialerFromEnv(&proxy)
 	return &proxy

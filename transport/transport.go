@@ -14,7 +14,7 @@ package transport
 import (
 	"bufio"
 	"compress/gzip"
-	"crypto/tls"
+	tls "github.com/refraction-networking/utls"
 	"encoding/base64"
 	"errors"
 	"fmt"

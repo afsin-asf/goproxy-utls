@@ -3,7 +3,6 @@ package goproxy
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	tls "github.com/refraction-networking/utls"
 
 	"github.com/elazarl/goproxy/internal/http1parser"
 	"github.com/elazarl/goproxy/internal/signer"
@@ -206,17 +207,17 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 
 	case ConnectHijack:
 		todo.Hijack(r, proxyClient, ctx)
-	case ConnectHTTPMitm, ConnectMitm:
-		_, _ = proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
-		ctx.Logf("Received CONNECT request, mitm proxying it")
-		// this goes in a separate goroutine, so that the net/http server won't think we're
-		// still handling the request even after hijacking the connection. Those HTTP CONNECT
-		// request can take forever, and the server will be stuck when "closed".
-		// TODO: Allow Server.Close() mechanism to shut down this connection as nicely as possible
-		go func() {
-			// Check if this is an HTTP or an HTTPS MITM request
-			readBuffer := bufio.NewReader(proxyClient)
-			peek, _ := readBuffer.Peek(1)
+		case ConnectHTTPMitm, ConnectMitm:
+			_, _ = proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
+			ctx.Logf("Received CONNECT request, mitm proxying it")
+			// this goes in a separate goroutine, so that the net/http server won't think we're
+			// still handling the request even after hijacking the connection. Those HTTP CONNECT
+			// request can take forever, and the server will be stuck when "closed".
+			// TODO: Allow Server.Close() mechanism to shut down this connection as nicely as possible
+			go func() {
+				// Check if this is an HTTP or an HTTPS MITM request
+				readBuffer := bufio.NewReader(proxyClient)
+				peek, _ := readBuffer.Peek(1)
 			isTLS := len(peek) > 0 && peek[0] == _tlsRecordTypeHandshake
 
 			var client net.Conn = &readBufferedConn{Conn: proxyClient, r: readBuffer}
@@ -237,6 +238,19 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						return
 					}
 				}
+
+				// Wrap the connection to capture raw ClientHello bytes for fingerprinting
+				client = wrapConnToCapture(client, func(rawBytes []byte) {
+					ctx.RawClientHello = rawBytes
+					// Fingerprint the captured ClientHello
+					spec := fingerprintClientHello(rawBytes)
+					if spec != nil {
+						ctx.ClientHelloSpec = spec
+						ctx.Logf("Captured ClientHello fingerprint from incoming connection")
+					} else {
+						ctx.Logf("Could not fingerprint ClientHello, will use default Chrome")
+					}
+				})
 
 				// Create a TLS connection over the TCP connection
 				rawClientTls := tls.Server(client, tlsConfig)
@@ -521,7 +535,7 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxyWithHandler(
 				return nil, err
 			}
 
-			c, err = proxy.initializeTLSconnection(ctx, c, proxy.Tr.TLSClientConfig, u.Host)
+			c, err = proxy.initializeTLSconnection(ctx, c, proxy.TLSClientConfig, u.Host)
 			if err != nil {
 				return nil, err
 			}
@@ -607,9 +621,32 @@ func (proxy *ProxyHttpServer) initializeTLSconnection(
 		tlsConfig = c
 	}
 
-	tlsConn := tls.Client(targetConn, tlsConfig)
-	if err := tlsConn.HandshakeContext(ctx.Req.Context()); err != nil {
+	// Use the incoming client's TLS fingerprint if captured via ClientHelloSpec
+	if ctx.ClientHelloSpec != nil {
+		// Use ApplyPreset with the captured fingerprint spec
+		uConn, err := createClientHelloFrom(targetConn, ctx.ClientHelloSpec, tlsConfig)
+		if err != nil {
+			ctx.Warnf("Failed to apply captured ClientHello spec: %v, falling back to default", err)
+			// Fall back to default Chrome
+			uConn := tls.UClient(targetConn, tlsConfig, tls.HelloChrome_Auto)
+			if err := uConn.HandshakeContext(ctx.Req.Context()); err != nil {
+				return nil, err
+			}
+			return uConn, nil
+		}
+		ctx.Logf("Using captured ClientHello fingerprint for outgoing connection")
+		if err := uConn.HandshakeContext(ctx.Req.Context()); err != nil {
+			return nil, err
+		}
+		return uConn, nil
+	}
+
+	// Fall back to default Chrome fingerprint if no capture
+	ctx.Logf("Using default Chrome fingerprint for outgoing connection")
+	uConn := tls.UClient(targetConn, tlsConfig, tls.HelloChrome_Auto)
+	if err := uConn.HandshakeContext(ctx.Req.Context()); err != nil {
 		return nil, err
 	}
-	return tlsConn, nil
+	return uConn, nil
 }
+

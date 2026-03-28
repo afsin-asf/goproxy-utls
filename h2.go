@@ -3,7 +3,7 @@ package goproxy
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
+	tls "github.com/refraction-networking/utls"
 	"errors"
 	"io"
 	"net"

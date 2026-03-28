@@ -1,8 +1,9 @@
 package goproxy
 
 import (
-	"crypto/tls"
 	"crypto/x509"
+
+	tls "github.com/refraction-networking/utls"
 )
 
 var GoproxyCa tls.Certificate

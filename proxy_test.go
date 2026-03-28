@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/elazarl/goproxy"
+	utlstls "github.com/refraction-networking/utls"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -803,13 +804,13 @@ func TestHasGoproxyCA(t *testing.T) {
 }
 
 type TestCertStorage struct {
-	certs  map[string]*tls.Certificate
+	certs  map[string]*utlstls.Certificate
 	hits   int
 	misses int
 }
 
-func (tcs *TestCertStorage) Fetch(hostname string, gen func() (*tls.Certificate, error)) (*tls.Certificate, error) {
-	var cert *tls.Certificate
+func (tcs *TestCertStorage) Fetch(hostname string, gen func() (*utlstls.Certificate, error)) (*utlstls.Certificate, error) {
+	var cert *utlstls.Certificate
 	var err error
 	cert, ok := tcs.certs[hostname]
 	if ok {
@@ -837,7 +838,7 @@ func (tcs *TestCertStorage) statMisses() int {
 
 func newTestCertStorage() *TestCertStorage {
 	tcs := &TestCertStorage{}
-	tcs.certs = make(map[string]*tls.Certificate)
+	tcs.certs = make(map[string]*utlstls.Certificate)
 
 	return tcs
 }

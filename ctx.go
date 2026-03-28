@@ -2,7 +2,7 @@ package goproxy
 
 import (
 	"context"
-	"crypto/tls"
+	tls "github.com/refraction-networking/utls"
 	"mime"
 	"net"
 	"net/http"
@@ -28,6 +28,12 @@ type ProxyCtx struct {
 	Session   int64
 	certStore CertStorage
 	Proxy     *ProxyHttpServer
+	// ClientHelloSpec contains the TLS fingerprint spec from the incoming client connection
+	// Used to mimic the client's fingerprint in outgoing connections using ApplyPreset
+	ClientHelloSpec *tls.ClientHelloSpec
+	// RawClientHello contains the raw ClientHello bytes captured from incoming connection
+	// Used to generate the ClientHelloSpec via Fingerprinter
+	RawClientHello []byte
 }
 
 type RoundTripper interface {
