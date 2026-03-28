@@ -40,8 +40,14 @@ func (proxy *ProxyHttpServer) getOrCreateTransport(spec *utls.ClientHelloSpec) *
 		return proxy.getDefaultUTLSTransport()
 	}
 
-	// Hash the spec to use as cache key
-	key := fingerprintSpecHash(spec)
+	// Create new transport with this fingerprint
+	var nextProtos []string
+	if proxy.Tr.TLSClientConfig != nil {
+		nextProtos = proxy.Tr.TLSClientConfig.NextProtos
+	}
+	
+	// Use cache key that includes both spec and NextProtos
+	key := fingerprintSpecHash(spec, proxy.Tr.DisableCompression, nextProtos)
 
 	transportCache.mu.RLock()
 	if tr, ok := transportCache.cache[key]; ok {
@@ -51,7 +57,7 @@ func (proxy *ProxyHttpServer) getOrCreateTransport(spec *utls.ClientHelloSpec) *
 	transportCache.mu.RUnlock()
 
 	// Create new transport with this fingerprint
-	tr := newUTLSTransport(spec)
+	tr := newUTLSTransport(spec, proxy.Tr.DisableCompression, nextProtos)
 
 	transportCache.mu.Lock()
 	transportCache.cache[key] = tr
@@ -61,7 +67,7 @@ func (proxy *ProxyHttpServer) getOrCreateTransport(spec *utls.ClientHelloSpec) *
 }
 
 // Ortak transport oluşturma fonksiyonu - rekürsyon riski yok
-func newUTLSTransport(spec *utls.ClientHelloSpec) *http.Transport {
+func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextProtos []string) *http.Transport {
 	return &http.Transport{
 		// Regular dial for plain HTTP
 		DialContext: (&net.Dialer{}).DialContext,
@@ -77,6 +83,7 @@ func newUTLSTransport(spec *utls.ClientHelloSpec) *http.Transport {
 			tlsConfig := &utls.Config{
 				ServerName:         host,
 				InsecureSkipVerify: true, // needed for test servers with self-signed certs
+				NextProtos:         append([]string{"h2"}, nextProtos...), // Always try HTTP/2 first
 			}
 
 			var helloID utls.ClientHelloID
@@ -106,38 +113,58 @@ func newUTLSTransport(spec *utls.ClientHelloSpec) *http.Transport {
 
 			return uConn, nil
 		},
-		ForceAttemptHTTP2: true,
+		ForceAttemptHTTP2:   true,
+		DisableCompression: disableCompression,
 	}
 }
 func (proxy *ProxyHttpServer) getDefaultUTLSTransport() *http.Transport {
-	const defaultKey = "default-chrome"
+	// Default: Chrome fingerprint with DisableCompression setting and proxy TLS config
+	var nextProtos []string
+	if proxy.Tr.TLSClientConfig != nil {
+		nextProtos = proxy.Tr.TLSClientConfig.NextProtos
+	}
+	
+	// Create a key that includes DisableCompression and NextProtos
+	key := fingerprintSpecHash(nil, proxy.Tr.DisableCompression, nextProtos)
 
 	transportCache.mu.RLock()
-	if tr, ok := transportCache.cache[defaultKey]; ok {
+	if tr, ok := transportCache.cache[key]; ok {
 		transportCache.mu.RUnlock()
 		return tr
 	}
 	transportCache.mu.RUnlock()
 
-	// Default: Chrome fingerprint
-	tr := newUTLSTransport(nil)
+	tr := newUTLSTransport(nil, proxy.Tr.DisableCompression, nextProtos)
 
 	transportCache.mu.Lock()
-	transportCache.cache[defaultKey] = tr
+	transportCache.cache[key] = tr
 	transportCache.mu.Unlock()
 
 	return tr
 }
 
 
-func fingerprintSpecHash(spec *utls.ClientHelloSpec) string {
-	if spec == nil {
-		return "default-chrome"
-	}
-	// Simple hash based on cipher suites and extensions
+func fingerprintSpecHash(spec *utls.ClientHelloSpec, disableCompression bool, nextProtos []string) string {
 	h := sha256.New()
-	for _, suite := range spec.CipherSuites {
-		binary.Write(h, binary.BigEndian, suite)
+	
+	if spec == nil {
+		h.Write([]byte("default-chrome"))
+	} else {
+		// Hash based on cipher suites
+		for _, suite := range spec.CipherSuites {
+			binary.Write(h, binary.BigEndian, suite)
+		}
 	}
+	
+	// Include compression setting in the hash
+	if disableCompression {
+		h.Write([]byte("-no-compression"))
+	}
+	
+	// Include NextProtos in the hash to distinguish different HTTP/2 configs
+	for _, proto := range nextProtos {
+		h.Write([]byte("-" + proto))
+	}
+	
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
