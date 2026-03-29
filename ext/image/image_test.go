@@ -11,10 +11,25 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 var acceptAllCerts = &tls.Config{InsecureSkipVerify: true}
+
+// testDataPath returns the path to the test data directory
+func testDataPath(filename string) string {
+	_, currentFile, _, _ := runtime.Caller(0)
+	testDataDir := filepath.Join(filepath.Dir(currentFile), "..", "..", "test_data")
+	return filepath.Join(testDataDir, filename)
+}
+
+// workingDir returns the directory relative to project root for file serving
+func workingDir() string {
+	_, currentFile, _, _ := runtime.Caller(0)
+	return filepath.Join(filepath.Dir(currentFile), "..", "..")
+}
 
 func oneShotProxy(proxy *goproxy.ProxyHttpServer, t *testing.T) (client *http.Client, s *httptest.Server) {
 	s = httptest.NewServer(proxy)
@@ -54,13 +69,13 @@ func compareImage(eImg, aImg image.Image, t *testing.T) {
 	}
 }
 
-var fs = httptest.NewServer(http.FileServer(http.Dir(".")))
+var fs = httptest.NewServer(http.FileServer(http.Dir(workingDir())))
 
 func localFile(url string) string { return fs.URL + "/" + url }
 
 func TestConstantImageHandler(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
-	football := getImage("test_data/football.png", t)
+	football := getImage(testDataPath("football.png"), t)
 	proxy.OnResponse().Do(goproxy_image.HandleImage(func(img image.Image, ctx *goproxy.ProxyCtx) image.Image {
 		return football
 	}))
@@ -83,7 +98,7 @@ func TestConstantImageHandler(t *testing.T) {
 
 func TestImageHandler(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
-	football := getImage("test_data/football.png", t)
+	football := getImage(testDataPath("football.png"), t)
 
 	proxy.OnResponse(goproxy.UrlIs("/test_data/panda.png")).Do(goproxy_image.HandleImage(func(img image.Image, ctx *goproxy.ProxyCtx) image.Image {
 		return football
@@ -148,8 +163,8 @@ func getOrFail(url string, client *http.Client, t *testing.T) []byte {
 func TestReplaceImage(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
 
-	panda := getImage("test_data/panda.png", t)
-	football := getImage("test_data/football.png", t)
+	panda := getImage(testDataPath("panda.png"), t)
+	football := getImage(testDataPath("football.png"), t)
 
 	proxy.OnResponse(goproxy.UrlIs("/test_data/panda.png")).Do(goproxy_image.HandleImage(func(img image.Image, ctx *goproxy.ProxyCtx) image.Image {
 		return football
