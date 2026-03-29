@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/elazarl/goproxy/internal/http1parser"
+	"github.com/afsin-asf/goproxy-utls/internal/http1parser"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

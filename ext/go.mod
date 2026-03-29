@@ -1,13 +1,15 @@
-module github.com/afsin-asf/goproxy-utls
+module github.com/afsin-asf/goproxy-utls/ext
 
-go 1.23.0
+go 1.25.0
 
 require (
-	github.com/elazarl/goproxy v0.0.0-20241217120900-7711dfa3811c
+	github.com/afsin-asf/goproxy-utls v0.0.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/net v0.36.0
 	golang.org/x/text v0.22.0
 )
+
+replace github.com/afsin-asf/goproxy-utls => ../
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect

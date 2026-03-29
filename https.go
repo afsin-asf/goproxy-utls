@@ -16,8 +16,8 @@ import (
 
 	tls "github.com/refraction-networking/utls"
 
-	"github.com/elazarl/goproxy/internal/http1parser"
-	"github.com/elazarl/goproxy/internal/signer"
+	"github.com/afsin-asf/goproxy-utls/internal/http1parser"
+	"github.com/afsin-asf/goproxy-utls/internal/signer"
 )
 
 type ConnectActionLiteral int

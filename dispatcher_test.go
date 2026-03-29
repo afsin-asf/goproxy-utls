@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/elazarl/goproxy"
+	"github.com/afsin-asf/goproxy-utls"
 )
 
 func TestIsLocalHost(t *testing.T) {

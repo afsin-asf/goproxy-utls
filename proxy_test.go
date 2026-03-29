@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/elazarl/goproxy"
+	"github.com/afsin-asf/goproxy-utls"
 	utlstls "github.com/refraction-networking/utls"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

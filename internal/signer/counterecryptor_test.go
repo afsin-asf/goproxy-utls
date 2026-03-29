@@ -9,7 +9,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/elazarl/goproxy/internal/signer"
+	"github.com/afsin-asf/goproxy-utls/internal/signer"
 )
 
 type RandSeedReader struct {

@@ -12,8 +12,8 @@ import (
 
 	utlstls "github.com/refraction-networking/utls"
 
-	"github.com/elazarl/goproxy"
-	"github.com/elazarl/goproxy/internal/signer"
+	"github.com/afsin-asf/goproxy-utls"
+	"github.com/afsin-asf/goproxy-utls/internal/signer"
 )
 
 func orFatal(t *testing.T, msg string, err error) {
