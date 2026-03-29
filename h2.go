@@ -3,12 +3,13 @@ package goproxy
 import (
 	"bufio"
 	"context"
-	tls "github.com/refraction-networking/utls"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+
+	tls "github.com/refraction-networking/utls"
 
 	"golang.org/x/net/http2"
 )
@@ -23,6 +24,7 @@ type H2Transport struct {
 	ClientWriter io.Writer
 	TLSConfig    *tls.Config
 	Host         string
+	ProxyCtx     *ProxyCtx // [uTLS] ProxyCtx for client fingerprinting
 }
 
 // RoundTrip executes an HTTP/2 session (including all contained streams).
@@ -41,25 +43,46 @@ func (r *H2Transport) RoundTrip(_ *http.Request) (*http.Response, error) {
 	// Ensure that we only advertise HTTP/2 as the accepted protocol.
 	r.TLSConfig.NextProtos = []string{http2.NextProtoTLS}
 	// Initiate TLS and check remote host name against certificate.
-	rawServerTLS = tls.Client(rawServerTLS, r.TLSConfig)
-	rawTLSConn, ok := rawServerTLS.(*tls.Conn)
-	if !ok {
-		return nil, errors.New("invalid TLS connection")
+	// [uTLS] Use UClient with ClientHelloSpec if available for fingerprinting
+	var rawServerTLSConn net.Conn = rawServerTLS
+	if r.ProxyCtx != nil && r.ProxyCtx.ClientHelloSpec != nil {
+		uconn := tls.UClient(rawServerTLS, r.TLSConfig, tls.HelloCustom)
+		uconn.ApplyPreset(r.ProxyCtx.ClientHelloSpec)
+		uconn.BuildHandshakeState()
+		rawServerTLSConn = uconn
+	} else {
+		rawServerTLSConn = tls.Client(rawServerTLS, r.TLSConfig)
 	}
-	if err = rawTLSConn.HandshakeContext(context.Background()); err != nil {
+	// Handle both regular tls.Conn and uTLS UConn
+	var tlsConnForHandshake interface{ HandshakeContext(context.Context) error }
+	switch conn := rawServerTLSConn.(type) {
+	case *tls.Conn:
+		tlsConnForHandshake = conn
+	case *tls.UConn:
+		tlsConnForHandshake = conn
+	default:
+		return nil, errors.New("invalid TLS connection type")
+	}
+	if err = tlsConnForHandshake.HandshakeContext(context.Background()); err != nil {
 		return nil, err
 	}
 	if r.TLSConfig == nil || !r.TLSConfig.InsecureSkipVerify {
-		if err = rawTLSConn.VerifyHostname(raddr[:strings.LastIndex(raddr, ":")]); err != nil {
-			return nil, err
+		tlsConnForVerify := rawServerTLSConn
+		if uconn, ok := rawServerTLSConn.(*tls.UConn); ok {
+			tlsConnForVerify = uconn.Conn
+		}
+		if tlsConn, ok := tlsConnForVerify.(*tls.Conn); ok {
+			if err = tlsConn.VerifyHostname(raddr[:strings.LastIndex(raddr, ":")]); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// Send new client preface to match the one parsed in req.
-	if _, err := io.WriteString(rawServerTLS, http2.ClientPreface); err != nil {
+	if _, err := io.WriteString(rawServerTLSConn, http2.ClientPreface); err != nil {
 		return nil, err
 	}
-	serverTLSReader := bufio.NewReader(rawServerTLS)
-	cToS := http2.NewFramer(rawServerTLS, r.ClientReader)
+	serverTLSReader := bufio.NewReader(rawServerTLSConn)
+	cToS := http2.NewFramer(rawServerTLSConn, r.ClientReader)
 	sToC := http2.NewFramer(r.ClientWriter, serverTLSReader)
 	errSToC := make(chan error)
 	errCToS := make(chan error)

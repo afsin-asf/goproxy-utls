@@ -313,7 +313,7 @@ go func() {
 								reqCtx.Warnf("HTTP2 connection failed: disallowed")
 								return false
 							}
-							tr := H2Transport{reader, client, tlsConfig, host}
+							tr := H2Transport{reader, client, tlsConfig, host, reqCtx}
 							if _, err := tr.RoundTrip(req); err != nil {
 								reqCtx.Warnf("HTTP2 connection failed: %v", err)
 							} else {
@@ -572,7 +572,9 @@ func TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *ProxyCtx) (*tls
 			return nil, err
 		}
 
-		config.Certificates = append(config.Certificates, *cert)
+		// Replace the certificate list with only the generated certificate
+		// (not appended to defaultTLSConfig.Certificates which contains the CA cert)
+		config.Certificates = []tls.Certificate{*cert}
 		return config, nil
 	}
 }

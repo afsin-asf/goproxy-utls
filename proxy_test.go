@@ -1062,7 +1062,6 @@ func TestResponseContentLength(t *testing.T) {
 }
 
 func TestMITMResponseHTTP2MissingContentLength(t *testing.T) {
-	t.Skip("HTTP/2 support in MITM mode requires golang.org/x/net/http2 integration")
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		if f, ok := w.(http.Flusher); ok {
@@ -1080,6 +1079,7 @@ func TestMITMResponseHTTP2MissingContentLength(t *testing.T) {
 
 	// proxy server
 	proxy := goproxy.NewProxyHttpServer()
+	proxy.AllowHTTP2 = true
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		// Connection between the proxy client and the proxy server
@@ -1374,7 +1374,6 @@ func TestPersistentMitmRequest(t *testing.T) {
 }
 
 func TestMITMResponseHTTP2ProtoVersion(t *testing.T) {
-	t.Skip("HTTP/2 support in MITM mode requires golang.org/x/net/http2 integration")
 	// Upstream HTTP/2 server
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -1388,6 +1387,7 @@ func TestMITMResponseHTTP2ProtoVersion(t *testing.T) {
 
 	// Proxy with MITM and HTTP/2 upstream transport
 	proxy := goproxy.NewProxyHttpServer()
+	proxy.AllowHTTP2 = true
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 	proxy.Tr = &http.Transport{
 		ForceAttemptHTTP2: true,
