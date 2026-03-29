@@ -1,4 +1,4 @@
-module github.com/afsin-asf/goproxy
+module github.com/afsin-asf/goproxy-utls
 
 go 1.23.0
 
