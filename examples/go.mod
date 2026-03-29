@@ -1,4 +1,4 @@
-module github.com/afsin-asf/goproxy-utls/examples/goproxy-transparent
+module github.com/afsin-asf/goproxy-utls/examples
 
 go 1.23
 
