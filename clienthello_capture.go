@@ -119,13 +119,28 @@ func (c *clientHelloCaptureConn) ClientHelloBytes() []byte {
 // rawBytes should include the full TLS record (with type/version/length header)
 // Returns nil if fingerprinting fails (caller should handle gracefully)
 func fingerprintClientHello(rawBytes []byte) *tls.ClientHelloSpec {
+	// Try using FromRaw which is more flexible with unknown extensions
+	spec := &tls.ClientHelloSpec{}
+	err := spec.FromRaw(rawBytes)
+	if err == nil {
+		return spec
+	}
+
+	// If FromRaw fails, try Fingerprinter (which has stricter parsing)
 	fingerprinter := &tls.Fingerprinter{}
-	spec, err := fingerprinter.FingerprintClientHello(rawBytes)
+	spec2, err := fingerprinter.FingerprintClientHello(rawBytes)
 	if err != nil {
 		// Failed to fingerprint - will fall back to default
 		return nil
 	}
-	return spec
+	return spec2
+}
+
+// stripExtension49 placeholder for potential future use
+func stripExtension49(rawBytes []byte) []byte {
+	// Extension 49 (post_handshake_auth) is not yet supported by utls
+	// but ClientHelloSpec.FromRaw should handle it gracefully
+	return nil
 }
 
 // createClientHelloFrom creates a new ClientHello that mimics the original spec
