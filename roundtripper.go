@@ -68,9 +68,15 @@ func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextP
 
         host, _, _ := net.SplitHostPort(addr)
 
+        // Context'ten spec'i oku
+        contextSpec, ok := ctx.Value("clientHelloSpec").(*utls.ClientHelloSpec)
+        if !ok {
+            contextSpec = spec  // Fallback to original spec
+        }
+
         var protos []string
-        if spec != nil {
-            protos = extractALPNFromSpec(spec)
+        if contextSpec != nil {
+            protos = extractALPNFromSpec(contextSpec)
             if len(protos) == 0 {
                 protos = []string{"h2", "http/1.1"}
             }
@@ -88,7 +94,7 @@ func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextP
         }
 
         var helloID utls.ClientHelloID
-        if spec == nil {
+        if contextSpec == nil {
             helloID = utls.HelloChrome_Auto
         } else {
             helloID = utls.HelloCustom
@@ -96,8 +102,8 @@ func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextP
 
         uConn := utls.UClient(rawConn, tlsConfig, helloID)
 
-        if spec != nil {
-            if err := uConn.ApplyPreset(spec); err != nil {
+        if contextSpec != nil {
+            if err := uConn.ApplyPreset(contextSpec); err != nil {
                 rawConn.Close()
                 rawConn2, err2 := (&net.Dialer{}).DialContext(ctx, network, addr)
                 if err2 != nil {
@@ -135,6 +141,7 @@ func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextP
     return &autoH2RoundTripper{
         h1:             h1Transport,
         h2:             h2Transport,
+        spec:           spec,
         dialTLSContext: dialTLSContext,
     }
 }
@@ -142,6 +149,7 @@ func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextP
 type autoH2RoundTripper struct {
     h1             *http.Transport
     h2             *http2.Transport
+    spec           *utls.ClientHelloSpec // Store for access in RoundTrip
     dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
     
     mu          sync.RWMutex
@@ -185,8 +193,9 @@ func (rt *autoH2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
         return rt.h1.RoundTrip(req)
     }
 
-    // First contact: probe by dialing
-    conn, err := rt.dialTLSContext(req.Context(), "tcp", addr)
+    // First contact: probe by dialing - ClientHelloSpec'i context'e koy
+    ctx := context.WithValue(req.Context(), "clientHelloSpec", rt.spec)
+    conn, err := rt.dialTLSContext(ctx, "tcp", addr)
     if err != nil {
         return nil, err
     }
