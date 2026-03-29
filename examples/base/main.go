@@ -5,7 +5,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/elazarl/goproxy"
+	"github.com/afsin-asf/goproxy-utls"
 )
 
 func main() {

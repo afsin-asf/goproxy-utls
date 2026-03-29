@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"flag"
-	"github.com/elazarl/goproxy"
+	"github.com/afsin-asf/goproxy-utls"
 	"log"
 	"net"
 	"net/http"

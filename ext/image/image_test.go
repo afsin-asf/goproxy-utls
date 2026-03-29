@@ -3,8 +3,8 @@ package goproxy_image_test
 import (
 	"bytes"
 	"crypto/tls"
-	"github.com/elazarl/goproxy"
-	goproxy_image "github.com/elazarl/goproxy/ext/image"
+	"github.com/afsin-asf/goproxy-utls"
+	goproxy_image "github.com/afsin-asf/goproxy-utls/ext/image"
 	"image"
 	"io"
 	"net/http"
