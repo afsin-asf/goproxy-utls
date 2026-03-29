@@ -54,6 +54,8 @@ type ProxyHttpServer struct {
 	// Accept-Encoding header. To disable this behavior, set
 	// Tr.DisableCompression to true.
 	KeepAcceptEncoding bool
+	// transportCache: per-proxy cache of transports, keyed by fingerprint+compression
+	transportCache map[string]*http.Transport
 }
 
 var hasPort = regexp.MustCompile(`:\d+$`)
@@ -154,6 +156,7 @@ func NewProxyHttpServer() *ProxyHttpServer {
 		}),
 		Tr: &http.Transport{Proxy: http.ProxyFromEnvironment},
 		TLSClientConfig: tlsClientSkipVerify,
+		transportCache: make(map[string]*http.Transport),
 	}
 	proxy.ConnectDial = dialerFromEnv(&proxy)
 	return &proxy

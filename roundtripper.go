@@ -4,75 +4,67 @@ package goproxy
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"net"
 	"net/http"
 	"sync"
 
+	"golang.org/x/net/http2"
 	utls "github.com/refraction-networking/utls"
 )
 
-// RoundTrip on ProxyCtx uses the mirrored fingerprint
-func (ctx *ProxyCtx) RoundTrip(req *http.Request) (*http.Response, error) {
-	if ctx.RoundTripper != nil {
-		return ctx.RoundTripper.RoundTrip(req, ctx)
-	}
-
-	// Use fingerprint-aware transport
-	transport := ctx.Proxy.getOrCreateTransport(ctx.ClientHelloSpec)
-	return transport.RoundTrip(req)
+// Wrapper for utls.UConn that ensures proper HTTP/2 support in http.Transport
+// The issue is that http.Transport checks for HTTP/2 support in specific ways
+// that don't work with utls connections by default. This wrapper ensures
+// that the connection reports HTTP/2 protocol negotiation correctly.
+type http2CompatibleConn struct {
+	net.Conn
+	uConn *utls.UConn
 }
 
-// Transport cache - one transport per unique fingerprint
-type fingerprintTransportCache struct {
-	mu    sync.RWMutex
-	cache map[string]*http.Transport // key = fingerprint hash
-}
-
-var transportCache = &fingerprintTransportCache{
-	cache: make(map[string]*http.Transport),
-}
-
-func (proxy *ProxyHttpServer) getOrCreateTransport(spec *utls.ClientHelloSpec) *http.Transport {
-	// No fingerprint captured — use default Chrome
-	if spec == nil {
-		return proxy.getDefaultUTLSTransport()
-	}
-
-	// Create new transport with this fingerprint
-	var nextProtos []string
-	if proxy.Tr.TLSClientConfig != nil {
-		nextProtos = proxy.Tr.TLSClientConfig.NextProtos
-	}
+// ConnectionState returns the TLS connection state, needed for HTTP/2 detection in http.Transport
+func (c *http2CompatibleConn) ConnectionState() tls.ConnectionState {
+	// Convert utls ConnectionState to standard crypto/tls ConnectionState
+	uState := c.uConn.ConnectionState()
 	
-	// Use cache key that includes both spec and NextProtos
-	key := fingerprintSpecHash(spec, proxy.Tr.DisableCompression, nextProtos)
-
-	transportCache.mu.RLock()
-	if tr, ok := transportCache.cache[key]; ok {
-		transportCache.mu.RUnlock()
-		return tr
+	// Map the protocol negotiation information correctly
+	return tls.ConnectionState{
+		Version:                     uState.Version,
+		HandshakeComplete:           uState.HandshakeComplete,
+		DidResume:                   uState.DidResume,
+		CipherSuite:                 uState.CipherSuite,
+		NegotiatedProtocol:          uState.NegotiatedProtocol,
+		NegotiatedProtocolIsMutual:  uState.NegotiatedProtocolIsMutual,
+		ServerName:                  uState.ServerName,
+		PeerCertificates:            uState.PeerCertificates,
+		VerifiedChains:              uState.VerifiedChains,
+		OCSPResponse:                uState.OCSPResponse,
+		TLSUnique:                   uState.TLSUnique,
 	}
-	transportCache.mu.RUnlock()
+}
 
-	// Create new transport with this fingerprint
-	tr := newUTLSTransport(spec, proxy.Tr.DisableCompression, nextProtos)
+// Implement net.Conn interface delegation
+func (c *http2CompatibleConn) Read(b []byte) (int, error) {
+	return c.uConn.Read(b)
+}
 
-	transportCache.mu.Lock()
-	transportCache.cache[key] = tr
-	transportCache.mu.Unlock()
+func (c *http2CompatibleConn) Write(b []byte) (int, error) {
+	return c.uConn.Write(b)
+}
 
-	return tr
+func (c *http2CompatibleConn) Close() error {
+	return c.uConn.Close()
 }
 
 // Ortak transport oluşturma fonksiyonu - rekürsyon riski yok
 func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextProtos []string) *http.Transport {
-	return &http.Transport{
+	tr := &http.Transport{
 		// Regular dial for plain HTTP
 		DialContext: (&net.Dialer{}).DialContext,
 
-		// uTLS dial for HTTPS
+		// uTLS dial for HTTPS - with built-in HTTP/2 support
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			rawConn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 			if err != nil {
@@ -80,10 +72,22 @@ func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextP
 			}
 
 			host, _, _ := net.SplitHostPort(addr)
+			
+			// Build NextProtos based on whether we have a captured spec
+			var protos []string
+			if spec != nil {
+				// If we have a captured ClientHelloSpec, don't force NextProtos
+				// The spec's Extensions will contain ALPN if needed
+				protos = nil
+			} else {
+				// No spec: use default with h2
+				protos = append([]string{"h2"}, nextProtos...)
+			}
+			
 			tlsConfig := &utls.Config{
 				ServerName:         host,
 				InsecureSkipVerify: true, // needed for test servers with self-signed certs
-				NextProtos:         append([]string{"h2"}, nextProtos...), // Always try HTTP/2 first
+				NextProtos:         protos,
 			}
 
 			var helloID utls.ClientHelloID
@@ -111,60 +115,110 @@ func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextP
 				return nil, err
 			}
 
+			// Return the raw utls connection directly - http.Transport will check ConnectionState()
+			// via the utls.UConn interface which properly reports NegotiatedProtocol
 			return uConn, nil
 		},
+		//  MaxIdleConns:    100,
+		MaxIdleConnsPerHost: 100,
 		ForceAttemptHTTP2:   true,
 		DisableCompression: disableCompression,
 	}
-}
-func (proxy *ProxyHttpServer) getDefaultUTLSTransport() *http.Transport {
-	// Default: Chrome fingerprint with DisableCompression setting and proxy TLS config
-	var nextProtos []string
-	if proxy.Tr.TLSClientConfig != nil {
-		nextProtos = proxy.Tr.TLSClientConfig.NextProtos
+	
+	// Configure HTTP/2 support explicitly, but only when not using custom ClientHelloSpec
+	// If we have a spec, we preserve it exactly as-is without http2.ConfigureTransport modifications
+	if spec == nil {
+		http2.ConfigureTransport(tr)
 	}
 	
-	// Create a key that includes DisableCompression and NextProtos
-	key := fingerprintSpecHash(nil, proxy.Tr.DisableCompression, nextProtos)
+	return tr
+}
 
-	transportCache.mu.RLock()
-	if tr, ok := transportCache.cache[key]; ok {
-		transportCache.mu.RUnlock()
+// Globally apply HTTP/2 config to proxy.Tr if it has h2 in NextProtos
+// This is done in a thread-safe way on first use
+var (
+	http2ConfiguredTransports sync.Map // Track which transports have been configured with http2
+)
+
+func markHTTP2Configured(tr *http.Transport) {
+	http2ConfiguredTransports.Store(tr, true)
+}
+
+func isHTTP2Configured(tr *http.Transport) bool {
+	_, ok := http2ConfiguredTransports.Load(tr)
+	return ok
+}
+
+// RoundTrip on ProxyCtx uses the mirrored fingerprint
+func (ctx *ProxyCtx) RoundTrip(req *http.Request) (*http.Response, error) {
+	if ctx.RoundTripper != nil {
+		return ctx.RoundTripper.RoundTrip(req, ctx)
+	}
+
+	// Use fingerprint-aware transport
+	transport := ctx.Proxy.getOrCreateTransport(ctx.ClientHelloSpec)
+	return transport.RoundTrip(req)
+}
+
+func (proxy *ProxyHttpServer) getOrCreateTransport(
+	spec *utls.ClientHelloSpec,
+) *http.Transport {
+	// Include both spec hash and compression setting in cache key
+	specKey := fingerprintSpecHash(spec)
+	compressionKey := "0"
+	if proxy.Tr.DisableCompression {
+		compressionKey = "1"
+	}
+	key := specKey + "-" + compressionKey
+
+	// Check cache
+	if tr, ok := proxy.transportCache[key]; ok {
 		return tr
 	}
-	transportCache.mu.RUnlock()
 
-	tr := newUTLSTransport(nil, proxy.Tr.DisableCompression, nextProtos)
+	// Special case: if no spec and proxy.Tr has HTTP/2 setup, use it as-is
+	if spec == nil && proxy.Tr.TLSClientConfig != nil {
+		// Check if proxy.Tr was explicitly set up for HTTP/2
+		hasH2 := false
+		for _, proto := range proxy.Tr.TLSClientConfig.NextProtos {
+			if proto == "h2" {
+				hasH2 = true
+				break
+			}
+		}
+		if hasH2 && proxy.Tr.DialTLSContext == nil {
+			// Apply HTTP/2 support to proxy.Tr if not already configured
+			if !isHTTP2Configured(proxy.Tr) {
+				http2.ConfigureTransport(proxy.Tr)
+				markHTTP2Configured(proxy.Tr)
+			}
+			// Return it directly without caching (it's user-managed)
+			return proxy.Tr
+		}
+	}
 
-	transportCache.mu.Lock()
-	transportCache.cache[key] = tr
-	transportCache.mu.Unlock()
+	// Create transport with the proxy's DisableCompression setting
+	tr := newUTLSTransport(spec, proxy.Tr.DisableCompression, nil)
+
+	// Store in cache
+	proxy.transportCache[key] = tr
 
 	return tr
 }
 
+func (proxy *ProxyHttpServer) getDefaultUTLSTransport() *http.Transport {
+	// Use nil spec to get Chrome default fingerprint
+	return proxy.getOrCreateTransport(nil)
+}
 
-func fingerprintSpecHash(spec *utls.ClientHelloSpec, disableCompression bool, nextProtos []string) string {
-	h := sha256.New()
-	
+func fingerprintSpecHash(spec *utls.ClientHelloSpec) string {
 	if spec == nil {
-		h.Write([]byte("default-chrome"))
-	} else {
-		// Hash based on cipher suites
-		for _, suite := range spec.CipherSuites {
-			binary.Write(h, binary.BigEndian, suite)
-		}
+		return "default-chrome"
 	}
-	
-	// Include compression setting in the hash
-	if disableCompression {
-		h.Write([]byte("-no-compression"))
+	// Simple hash based on cipher suites and extensions
+	h := sha256.New()
+	for _, suite := range spec.CipherSuites {
+		binary.Write(h, binary.BigEndian, suite)
 	}
-	
-	// Include NextProtos in the hash to distinguish different HTTP/2 configs
-	for _, proto := range nextProtos {
-		h.Write([]byte("-" + proto))
-	}
-	
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }

@@ -1,6 +1,7 @@
 package goproxy
 
 import (
+	"io"
 	"net"
 	"sync"
 
@@ -11,6 +12,32 @@ const (
 	_tlsRecordTypeHandshake uint8 = 0x16
 	_tlsHandshakeClientHello uint8 = 0x01
 )
+
+// capturingBufferedReader wraps an io.Reader (like a bufio.Reader) and forwards
+// all data to a clientHelloCaptureConn for capture, while still serving the data.
+type capturingBufferedReader struct {
+	source      io.Reader
+	captureConn *clientHelloCaptureConn
+}
+
+func (c *capturingBufferedReader) Read(b []byte) (int, error) {
+	n, err := c.source.Read(b)
+	if n > 0 {
+		// Forward ALL data through the capture wrapper
+		captured := make([]byte, n)
+		copy(captured, b[:n])
+		// Simulate a Read through the capture wrapper
+		if !c.captureConn.captured {
+			c.captureConn.mu.Lock()
+			if c.captureConn.capturing {
+				c.captureConn.buf = append(c.captureConn.buf, captured...)
+				c.captureConn.tryExtractClientHello()
+			}
+			c.captureConn.mu.Unlock()
+		}
+	}
+	return n, err
+}
 
 // clientHelloCaptureConn wraps a net.Conn and captures the raw ClientHello
 // message during the TLS handshake. It does NOT consume bytes — it copies

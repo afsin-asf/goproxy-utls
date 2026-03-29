@@ -220,16 +220,24 @@ go func() {
             }
         }
 
-        // ✅ FIX: readBuffer'ı içeren conn'u kullan, raw proxyClient'ı değil!
-        bufferedConn := &readBufferedConn{Conn: proxyClient, r: readBuffer}
-        captureConn := newClientHelloCaptureConn(bufferedConn)
+        // Wrap client connection with ClientHello capture wrapper that includes buffering
+        captureConn := newClientHelloCaptureConn(proxyClient)
+        // Create a capturing buffered reader wrapper
+        capturingReader := &capturingBufferedReader{
+            source:      readBuffer,
+            captureConn: captureConn,
+        }
+        // Use capturing reader with the capture connection
+        bufferedConn := &readBufferedConn{Conn: captureConn, r: capturingReader}
 
-        rawClientTls := tls.Server(captureConn, tlsConfig)
+        // Use wrapper to capture and fingerprint client TLS
+        rawClientTls := tls.Server(bufferedConn, tlsConfig)
         if err := rawClientTls.HandshakeContext(context.Background()); err != nil {
             ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
             return
         }
 
+        // ✅ Capture the raw ClientHello for TLS fingerprinting
         capturedRawHello = captureConn.ClientHelloBytes()
         if capturedRawHello != nil {
             spec, err := fingerprinter.FingerprintClientHello(capturedRawHello)
