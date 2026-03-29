@@ -1,4 +1,4 @@
-module github.com/elazarl/goproxy
+module github.com/afsin-asf/goproxy-utls
 
 go 1.25.0
 
