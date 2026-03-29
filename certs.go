@@ -22,13 +22,17 @@ func init() {
 	if GoproxyCa.Leaf, err = x509.ParseCertificate(GoproxyCa.Certificate[0]); err != nil {
 		panic("Error parsing builtin CA leaf: " + err.Error())
 	}
+
+	// Initialize defaultTLSConfig with the CA certificate
+	defaultTLSConfig = &tls.Config{
+		Certificates:       []tls.Certificate{GoproxyCa},
+		InsecureSkipVerify: true,
+	}
 }
 
 var tlsClientSkipVerify = &tls.Config{InsecureSkipVerify: true}
 
-var defaultTLSConfig = &tls.Config{
-	InsecureSkipVerify: true,
-}
+var defaultTLSConfig *tls.Config
 
 var CA_CERT = []byte(`-----BEGIN CERTIFICATE-----
 MIIF9DCCA9ygAwIBAgIJAODqYUwoVjJkMA0GCSqGSIb3DQEBCwUAMIGOMQswCQYD
