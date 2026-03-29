@@ -1,4 +1,4 @@
-module github.com/elazarl/goproxy/ext
+module github.com/afsin-asf/goproxy
 
 go 1.23.0
 
