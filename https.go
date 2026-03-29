@@ -127,6 +127,13 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		certStore: proxy.CertStore,
 	}
 
+	// Initialize default RoundTripper if not set by user
+	if ctx.RoundTripper == nil {
+		ctx.RoundTripper = RoundTripperFunc(func(req *http.Request, ctx *ProxyCtx) (*http.Response, error) {
+			return ctx.Proxy.Tr.RoundTrip(req)
+		})
+	}
+
 	hij, ok := w.(http.Hijacker)
 	if !ok {
 		panic("httpserver does not support hijacking")
@@ -325,7 +332,7 @@ go func() {
 						if !proxy.KeepHeader {
 							RemoveProxyHeaders(reqCtx, req)
 						}
-						resp, err = reqCtx.RoundTrip(req)
+						resp, err = reqCtx.RoundTripper.RoundTrip(req, reqCtx)
 						if err != nil {
 							reqCtx.Warnf("Cannot read response from mitm'd server %v", err)
 							return false

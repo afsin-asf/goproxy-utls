@@ -7,12 +7,13 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"net/http"
 	"sync"
 
-	"golang.org/x/net/http2"
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // Wrapper for utls.UConn that ensures proper HTTP/2 support in http.Transport
@@ -58,83 +59,93 @@ func (c *http2CompatibleConn) Close() error {
 	return c.uConn.Close()
 }
 
-// Ortak transport oluşturma fonksiyonu - rekürsyon riski yok
-func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextProtos []string) *http.Transport {
-	tr := &http.Transport{
-		// Regular dial for plain HTTP
-		DialContext: (&net.Dialer{}).DialContext,
+func newUTLSTransport(spec *utls.ClientHelloSpec, disableCompression bool, nextProtos []string) http.RoundTripper {
+    dialTLSContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+        rawConn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+        if err != nil {
+            return nil, err
+        }
 
-		// uTLS dial for HTTPS - with built-in HTTP/2 support
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			rawConn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
+        host, _, _ := net.SplitHostPort(addr)
 
-			host, _, _ := net.SplitHostPort(addr)
-			
-			// Build NextProtos based on whether we have a captured spec
-			var protos []string
-			if spec != nil {
-				// If we have a captured ClientHelloSpec, extract ALPN from its extensions
-				// Otherwise add h2 to allow HTTP/2 support
-				protos = extractALPNFromSpec(spec)
-				if len(protos) == 0 {
-					// No ALPN in spec, add h2 to enable HTTP/2
-					protos = []string{"h2"}
-				}
-			} else {
-				// No spec: use default with h2
-				protos = append([]string{"h2"}, nextProtos...)
-			}
-			
-			tlsConfig := &utls.Config{
-				ServerName:         host,
-				InsecureSkipVerify: true, // needed for test servers with self-signed certs
-				NextProtos:         protos,
-			}
+        var protos []string
+        if spec != nil {
+            protos = extractALPNFromSpec(spec)
+            if len(protos) == 0 {
+                protos = []string{"h2", "http/1.1"}
+            }
+        } else {
+            protos = []string{"h2", "http/1.1"}
+            if len(nextProtos) > 0 {
+                protos = nextProtos
+            }
+        }
 
-			var helloID utls.ClientHelloID
-			if spec == nil {
-				helloID = utls.HelloChrome_Auto
-			} else {
-				helloID = utls.HelloCustom
-			}
+        tlsConfig := &utls.Config{
+            ServerName:         host,
+            InsecureSkipVerify: true,
+            NextProtos:         protos,
+        }
 
-			uConn := utls.UClient(rawConn, tlsConfig, helloID)
+        var helloID utls.ClientHelloID
+        if spec == nil {
+            helloID = utls.HelloChrome_Auto
+        } else {
+            helloID = utls.HelloCustom
+        }
 
-			if spec != nil {
-				if err := uConn.ApplyPreset(spec); err != nil {
-					rawConn.Close()
-					rawConn2, err := (&net.Dialer{}).DialContext(ctx, network, addr)
-					if err != nil {
-						return nil, err
-					}
-					uConn = utls.UClient(rawConn2, tlsConfig, utls.HelloChrome_Auto)
-				}
-			}
+        uConn := utls.UClient(rawConn, tlsConfig, helloID)
 
-			if err := uConn.HandshakeContext(ctx); err != nil {
-				rawConn.Close()
-				return nil, err
-			}
+        if spec != nil {
+            if err := uConn.ApplyPreset(spec); err != nil {
+                rawConn.Close()
+                rawConn2, err2 := (&net.Dialer{}).DialContext(ctx, network, addr)
+                if err2 != nil {
+                    return nil, err2
+                }
+                uConn = utls.UClient(rawConn2, tlsConfig, utls.HelloChrome_Auto)
+            }
+        }
 
-			// Return the raw utls connection directly - http.Transport will check ConnectionState()
-			// via the utls.UConn interface which properly reports NegotiatedProtocol
-			return uConn, nil
-		},
-		//  MaxIdleConns:    100,
-		MaxIdleConnsPerHost: 100,
-		ForceAttemptHTTP2:   true,
-		DisableCompression: disableCompression,
-	}
-	
-	// Configure HTTP/2 support to handle responses from HTTP/2 servers
-	// This is essential so the transport can receive and parse HTTP/2 responses
-	// even when the spec forces HTTP/1.1 in NextProtos
-	http2.ConfigureTransport(tr)
-	
-	return tr
+        if err := uConn.HandshakeContext(ctx); err != nil {
+            uConn.Close()
+            return nil, err
+        }
+
+        return uConn, nil
+    }
+
+    // HTTP/1.1 transport
+    h1Transport := &http.Transport{
+        DialContext:         (&net.Dialer{}).DialContext,
+        DialTLSContext:      dialTLSContext,
+        MaxIdleConnsPerHost: 100,
+        DisableCompression:  disableCompression,
+    }
+
+    // HTTP/2 transport — ayrı, kendi dial fonksiyonuyla
+    h2Transport := &http2.Transport{
+        DisableCompression: disableCompression,
+        DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+            return dialTLSContext(ctx, network, addr)
+        },
+    }
+
+    // Protokol seçimini otomatik yapan wrapper
+    return &autoH2RoundTripper{
+        h1:             h1Transport,
+        h2:             h2Transport,
+        dialTLSContext: dialTLSContext,
+    }
+}
+
+type autoH2RoundTripper struct {
+    h1             *http.Transport
+    h2             *http2.Transport
+    dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
+    
+    mu          sync.RWMutex
+    knownH2     map[string]bool // host -> supports h2
 }
 
 // Globally apply HTTP/2 config to proxy.Tr if it has h2 in NextProtos
@@ -152,20 +163,64 @@ func isHTTP2Configured(tr *http.Transport) bool {
 	return ok
 }
 
-// RoundTrip on ProxyCtx uses the mirrored fingerprint
-func (ctx *ProxyCtx) RoundTrip(req *http.Request) (*http.Response, error) {
-	if ctx.RoundTripper != nil {
-		return ctx.RoundTripper.RoundTrip(req, ctx)
-	}
+func (rt *autoH2RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+    if req.URL.Scheme != "https" {
+        return rt.h1.RoundTrip(req)
+    }
 
-	// Use fingerprint-aware transport
-	transport := ctx.Proxy.getOrCreateTransport(ctx.ClientHelloSpec)
-	return transport.RoundTrip(req)
+    addr := req.URL.Host
+    if _, _, err := net.SplitHostPort(addr); err != nil {
+        addr += ":443"
+    }
+
+    // Check if we already know this host speaks h2
+    rt.mu.RLock()
+    isH2, known := rt.knownH2[addr]
+    rt.mu.RUnlock()
+
+    if known && isH2 {
+        return rt.h2.RoundTrip(req)
+    }
+    if known && !isH2 {
+        return rt.h1.RoundTrip(req)
+    }
+
+    // First contact: probe by dialing
+    conn, err := rt.dialTLSContext(req.Context(), "tcp", addr)
+    if err != nil {
+        return nil, err
+    }
+
+    // Check negotiated protocol
+    uConn, ok := conn.(*utls.UConn)
+    if !ok {
+        conn.Close()
+        return nil, fmt.Errorf("unexpected connection type")
+    }
+
+    negotiated := uConn.ConnectionState().NegotiatedProtocol
+
+    rt.mu.Lock()
+    if rt.knownH2 == nil {
+        rt.knownH2 = make(map[string]bool)
+    }
+    rt.knownH2[addr] = (negotiated == "h2")
+    rt.mu.Unlock()
+
+    if negotiated == "h2" {
+        // Give this connection to h2 transport
+        conn.Close() // h2.Transport will dial its own connection
+        return rt.h2.RoundTrip(req)
+    }
+
+    // HTTP/1.1 — feed this connection back
+    conn.Close() // h1 transport will dial its own
+    return rt.h1.RoundTrip(req)
 }
 
 func (proxy *ProxyHttpServer) getOrCreateTransport(
 	spec *utls.ClientHelloSpec,
-) *http.Transport {
+) http.RoundTripper {
 	// Include both spec hash and compression setting in cache key
 	specKey := fingerprintSpecHash(spec)
 	compressionKey := "0"
@@ -209,7 +264,7 @@ func (proxy *ProxyHttpServer) getOrCreateTransport(
 	return tr
 }
 
-func (proxy *ProxyHttpServer) getDefaultUTLSTransport() *http.Transport {
+func (proxy *ProxyHttpServer) getDefaultUTLSTransport() http.RoundTripper {
 	// Use nil spec to get Chrome default fingerprint
 	return proxy.getOrCreateTransport(nil)
 }

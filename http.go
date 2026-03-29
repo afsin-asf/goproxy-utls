@@ -9,6 +9,12 @@ import (
 
 func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request) {
 	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), Proxy: proxy}
+	// Initialize default RoundTripper if not set by user
+	if ctx.RoundTripper == nil {
+		ctx.RoundTripper = RoundTripperFunc(func(req *http.Request, ctx *ProxyCtx) (*http.Response, error) {
+			return ctx.Proxy.Tr.RoundTrip(req)
+		})
+	}
 
 	ctx.Logf("Got request %v %v %v %v", r.URL.Path, r.Host, r.Method, r.URL.String())
 	if !r.URL.IsAbs() {
@@ -23,7 +29,7 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 		}
 
 		var err error
-		resp, err = ctx.RoundTrip(r)
+		resp, err = ctx.RoundTripper.RoundTrip(r, ctx)
 		if err != nil {
 			ctx.Error = err
 		}

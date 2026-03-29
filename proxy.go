@@ -55,7 +55,7 @@ type ProxyHttpServer struct {
 	// Tr.DisableCompression to true.
 	KeepAcceptEncoding bool
 	// transportCache: per-proxy cache of transports, keyed by fingerprint+compression
-	transportCache map[string]*http.Transport
+	transportCache map[string]http.RoundTripper
 }
 
 var hasPort = regexp.MustCompile(`:\d+$`)
@@ -156,7 +156,7 @@ func NewProxyHttpServer() *ProxyHttpServer {
 		}),
 		Tr: &http.Transport{Proxy: http.ProxyFromEnvironment},
 		TLSClientConfig: tlsClientSkipVerify,
-		transportCache: make(map[string]*http.Transport),
+		transportCache: make(map[string]http.RoundTripper),
 	}
 	proxy.ConnectDial = dialerFromEnv(&proxy)
 	return &proxy
