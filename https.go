@@ -335,7 +335,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						// Check for WebSocket upgrade request
 						if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") &&
 							strings.ContainsAny(strings.ToLower(req.Header.Get("Connection")), "upgrade") {
-							reqCtx.Logf("WebSocket upgrade request detected (client protocol: %s), proxying via uTLS", req.Proto)
+							reqCtx.Logf("WebSocket upgrade request detected (client protocol: %s), proxying with HTTP/1.1 only", req.Proto)
 
 							// Parse host and port properly (handles IPv6 addresses like [::1]:443)
 							host, port, err := net.SplitHostPort(req.Host)
@@ -353,17 +353,21 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							}
 							defer backendConn.Close()
 
-							// Initialize TLS connection with client's fingerprint
-							// IMPORTANT: For WebSockets, we must use HTTP/1.1 only (no HTTP/2)
-							// Create a copy of the TLS config and force HTTP/1.1
-							wsConfig := defaultTLSConfig.Clone()
-							wsConfig.NextProtos = []string{"http/1.1"}
+							// For WebSockets, we MUST negotiate HTTP/1.1 only (no HTTP/2)
+							// Create a minimal TLS config that only offers HTTP/1.1
+							wsConfig := &tls.Config{
+								InsecureSkipVerify: true,
+								NextProtos:         []string{"http/1.1"},
+								ServerName:         host,
+							}
 							
-							utlsConn, err := proxy.initializeTLSconnection(reqCtx, backendConn, wsConfig, host)
-							if err != nil {
-								reqCtx.Warnf("Failed to initialize TLS connection for WebSocket: %v", err)
+							// Use HelloCustom without any preset - this respects NextProtos from config
+							wsConn := tls.UClient(backendConn, wsConfig, tls.HelloCustom)
+							if err := wsConn.HandshakeContext(reqCtx.Req.Context()); err != nil {
+								reqCtx.Warnf("Failed to establish TLS connection for WebSocket: %v", err)
 								return false
 							}
+							utlsConn := wsConn
 
 							// Send the original WebSocket upgrade request to backend
 							if err := req.Write(utlsConn); err != nil {

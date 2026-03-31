@@ -157,3 +157,36 @@ func createClientHelloFrom(targetConn net.Conn, spec *tls.ClientHelloSpec, tlsCo
 	
 	return uConn, nil
 }
+
+// forceHTTP1InSpec modifies a ClientHelloSpec to only advertise HTTP/1.1 in ALPN
+// This is necessary for WebSocket upgrades which don't work with HTTP/2
+func forceHTTP1InSpec(spec *tls.ClientHelloSpec) *tls.ClientHelloSpec {
+	if spec == nil {
+		return nil
+	}
+	
+	// Clone the spec to avoid modifying the original
+	newSpec := *spec
+	
+	// Look for the ALPN extension in the spec
+	if len(newSpec.Extensions) > 0 {
+		for i, ext := range newSpec.Extensions {
+			// Check if this is the ALPN extension (type 16)
+			if alpnExt, ok := ext.(*tls.ALPNExtension); ok {
+				_ = alpnExt // Use the variable to avoid unused warning
+				// Create a new ALPN extension with only HTTP/1.1
+				newALPNExt := &tls.ALPNExtension{
+					AlpnProtocols: []string{"http/1.1"},
+				}
+				// Make a copy of extensions slice and replace the ALPN
+				newExts := make([]tls.TLSExtension, len(newSpec.Extensions))
+				copy(newExts, newSpec.Extensions)
+				newExts[i] = newALPNExt
+				newSpec.Extensions = newExts
+				break
+			}
+		}
+	}
+	
+	return &newSpec
+}
