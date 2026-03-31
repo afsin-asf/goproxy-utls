@@ -42,7 +42,6 @@ var (
 
 var _errorRespMaxLength int64 = 500
 
-
 type readBufferedConn struct {
 	net.Conn
 	r io.Reader
@@ -202,68 +201,68 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		_, _ = proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
 		ctx.Logf("Received CONNECT request, mitm proxying it")
 
-go func() {
-    readBuffer := bufio.NewReader(proxyClient)
-    peek, _ := readBuffer.Peek(1)
-    isTLS := len(peek) > 0 && peek[0] == _tlsRecordTypeHandshake
+		go func() {
+			readBuffer := bufio.NewReader(proxyClient)
+			peek, _ := readBuffer.Peek(1)
+			isTLS := len(peek) > 0 && peek[0] == _tlsRecordTypeHandshake
 
-    var capturedHelloSpec *tls.ClientHelloSpec
-    var capturedRawHello []byte
+			var capturedHelloSpec *tls.ClientHelloSpec
+			var capturedRawHello []byte
 
-    var tlsConfig *tls.Config
-    scheme := "http"
-    fingerprinter := &tls.Fingerprinter{}
-    var client net.Conn
+			var tlsConfig *tls.Config
+			scheme := "http"
+			fingerprinter := &tls.Fingerprinter{}
+			var client net.Conn
 
-    if isTLS {
-        scheme = "https"
-        tlsConfig = defaultTLSConfig
-        if todo.TLSConfig != nil {
-            var err error
-            tlsConfig, err = todo.TLSConfig(host, ctx)
-            if err != nil {
-                httpError(proxyClient, ctx, err)
-                return
-            }
-        }
+			if isTLS {
+				scheme = "https"
+				tlsConfig = defaultTLSConfig
+				if todo.TLSConfig != nil {
+					var err error
+					tlsConfig, err = todo.TLSConfig(host, ctx)
+					if err != nil {
+						httpError(proxyClient, ctx, err)
+						return
+					}
+				}
 
-        // Wrap client connection with ClientHello capture wrapper that includes buffering
-        captureConn := newClientHelloCaptureConn(proxyClient)
-        // Create a capturing buffered reader wrapper
-        capturingReader := &capturingBufferedReader{
-            source:      readBuffer,
-            captureConn: captureConn,
-        }
-        // Use capturing reader with the capture connection
-        bufferedConn := &readBufferedConn{Conn: captureConn, r: capturingReader}
+				// Wrap client connection with ClientHello capture wrapper that includes buffering
+				captureConn := newClientHelloCaptureConn(proxyClient)
+				// Create a capturing buffered reader wrapper
+				capturingReader := &capturingBufferedReader{
+					source:      readBuffer,
+					captureConn: captureConn,
+				}
+				// Use capturing reader with the capture connection
+				bufferedConn := &readBufferedConn{Conn: captureConn, r: capturingReader}
 
-        // Use wrapper to capture and fingerprint client TLS
-        rawClientTls := tls.Server(bufferedConn, tlsConfig)
-        if err := rawClientTls.HandshakeContext(context.Background()); err != nil {
-            ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
-            return
-        }
+				// Use wrapper to capture and fingerprint client TLS
+				rawClientTls := tls.Server(bufferedConn, tlsConfig)
+				if err := rawClientTls.HandshakeContext(context.Background()); err != nil {
+					ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
+					return
+				}
 
-        // ✅ Capture the raw ClientHello for TLS fingerprinting
-        capturedRawHello = captureConn.ClientHelloBytes()
-        if capturedRawHello != nil {
-            spec, err := fingerprinter.FingerprintClientHello(capturedRawHello)
-            if err == nil {
-                capturedHelloSpec = spec
-                ctx.Logf("Captured ClientHello fingerprint (%d bytes)", len(capturedRawHello))
-            } else {
-                ctx.Warnf("Failed to fingerprint ClientHello: %v", err)
-            }
-        }
+				// ✅ Capture the raw ClientHello for TLS fingerprinting
+				capturedRawHello = captureConn.ClientHelloBytes()
+				if capturedRawHello != nil {
+					spec, err := fingerprinter.FingerprintClientHello(capturedRawHello)
+					if err == nil {
+						capturedHelloSpec = spec
+						ctx.Logf("Captured ClientHello fingerprint (%d bytes)", len(capturedRawHello))
+					} else {
+						ctx.Warnf("Failed to fingerprint ClientHello: %v", err)
+					}
+				}
 
-        client = rawClientTls
-    } else {
-        client = &readBufferedConn{Conn: proxyClient, r: readBuffer}
-    }
+				client = rawClientTls
+			} else {
+				client = &readBufferedConn{Conn: proxyClient, r: readBuffer}
+			}
 
-    defer func() {
-        _ = client.Close()
-    }()
+			defer func() {
+				_ = client.Close()
+			}()
 
 			clientReader := http1parser.NewRequestReader(proxy.PreventCanonicalization, client)
 			for !clientReader.IsEOF() {
@@ -332,6 +331,58 @@ go func() {
 						if !proxy.KeepHeader {
 							RemoveProxyHeaders(reqCtx, req)
 						}
+
+						// Check for WebSocket upgrade request
+						if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") &&
+							strings.ContainsAny(strings.ToLower(req.Header.Get("Connection")), "upgrade") {
+							reqCtx.Logf("WebSocket upgrade request detected, proxying via uTLS")
+							
+							// Dial backend
+							backendConn, err := proxy.dial(reqCtx, "tcp", req.Host)
+							if err != nil {
+								reqCtx.Warnf("Failed to dial backend for WebSocket: %v", err)
+								return false
+							}
+							defer backendConn.Close()
+							
+							// Initialize TLS connection with client's fingerprint
+							utlsConn, err := proxy.initializeTLSconnection(reqCtx, backendConn, defaultTLSConfig, req.Host)
+							if err != nil {
+								reqCtx.Warnf("Failed to initialize TLS connection for WebSocket: %v", err)
+								return false
+							}
+							
+							// Send the original WebSocket upgrade request to backend
+							if err := req.Write(utlsConn); err != nil {
+								reqCtx.Warnf("Failed to send WebSocket upgrade request to backend: %v", err)
+								return false
+							}
+							
+							// Read the 101 response from backend
+							reader := bufio.NewReader(utlsConn)
+							resp, err = http.ReadResponse(reader, req)
+							if err != nil {
+								reqCtx.Warnf("Failed to read WebSocket 101 response from backend: %v", err)
+								return false
+							}
+							
+							// Check if we got a 101 response
+							if resp.StatusCode != http.StatusSwitchingProtocols {
+								reqCtx.Warnf("Backend returned status %d instead of 101", resp.StatusCode)
+								return false
+							}
+							
+							// Write the 101 response to the client (with proper Sec-WebSocket-Accept header)
+							if err := resp.Write(client); err != nil {
+								reqCtx.Warnf("Failed to write WebSocket 101 response to client: %v", err)
+								return false
+							}
+							
+							// Tunnel WebSocket frames between client and backend
+							proxy.proxyWebsocket(reqCtx, utlsConn, client)
+							return false
+						}
+
 						resp, err = reqCtx.RoundTripper.RoundTrip(req, reqCtx)
 						if err != nil {
 							reqCtx.Warnf("Cannot read response from mitm'd server %v", err)
@@ -626,4 +677,3 @@ func (proxy *ProxyHttpServer) initializeTLSconnection(
 	}
 	return uConn, nil
 }
-
