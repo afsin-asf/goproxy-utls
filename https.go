@@ -335,29 +335,42 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						// Check for WebSocket upgrade request
 						if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") &&
 							strings.ContainsAny(strings.ToLower(req.Header.Get("Connection")), "upgrade") {
-							reqCtx.Logf("WebSocket upgrade request detected, proxying via uTLS")
+							reqCtx.Logf("WebSocket upgrade request detected (client protocol: %s), proxying via uTLS", req.Proto)
+
+							// Parse host and port properly (handles IPv6 addresses like [::1]:443)
+							host, port, err := net.SplitHostPort(req.Host)
+							if err != nil {
+								// No port specified, use default
+								host = req.Host
+								port = "443"
+							}
+							backendAddr := net.JoinHostPort(host, port)
 							
-							// Dial backend
-							backendConn, err := proxy.dial(reqCtx, "tcp", req.Host)
+							backendConn, err := proxy.dial(reqCtx, "tcp", backendAddr)
 							if err != nil {
 								reqCtx.Warnf("Failed to dial backend for WebSocket: %v", err)
 								return false
 							}
 							defer backendConn.Close()
-							
+
 							// Initialize TLS connection with client's fingerprint
-							utlsConn, err := proxy.initializeTLSconnection(reqCtx, backendConn, defaultTLSConfig, req.Host)
+							// IMPORTANT: For WebSockets, we must use HTTP/1.1 only (no HTTP/2)
+							// Create a copy of the TLS config and force HTTP/1.1
+							wsConfig := defaultTLSConfig.Clone()
+							wsConfig.NextProtos = []string{"http/1.1"}
+							
+							utlsConn, err := proxy.initializeTLSconnection(reqCtx, backendConn, wsConfig, host)
 							if err != nil {
 								reqCtx.Warnf("Failed to initialize TLS connection for WebSocket: %v", err)
 								return false
 							}
-							
+
 							// Send the original WebSocket upgrade request to backend
 							if err := req.Write(utlsConn); err != nil {
 								reqCtx.Warnf("Failed to send WebSocket upgrade request to backend: %v", err)
 								return false
 							}
-							
+
 							// Read the 101 response from backend
 							reader := bufio.NewReader(utlsConn)
 							resp, err = http.ReadResponse(reader, req)
@@ -365,19 +378,22 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 								reqCtx.Warnf("Failed to read WebSocket 101 response from backend: %v", err)
 								return false
 							}
-							
+
 							// Check if we got a 101 response
 							if resp.StatusCode != http.StatusSwitchingProtocols {
 								reqCtx.Warnf("Backend returned status %d instead of 101", resp.StatusCode)
 								return false
 							}
-							
+
+							// Log successful WebSocket upgrade to confirm tunneling
+							reqCtx.Logf("WebSocket upgrade successful: client protocol=%s, backend using HTTP/1.1 with uTLS fingerprint", req.Proto)
+
 							// Write the 101 response to the client (with proper Sec-WebSocket-Accept header)
 							if err := resp.Write(client); err != nil {
 								reqCtx.Warnf("Failed to write WebSocket 101 response to client: %v", err)
 								return false
 							}
-							
+
 							// Tunnel WebSocket frames between client and backend
 							proxy.proxyWebsocket(reqCtx, utlsConn, client)
 							return false

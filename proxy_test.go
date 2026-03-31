@@ -1800,6 +1800,101 @@ func TestWebSocketMitm(t *testing.T) {
 	assert.Equal(t, "ECHO: Hello WebSocket", string(response))
 }
 
+// TestWebSocketMitmWithHTTP2 tests WebSocket proxying when the client negotiates HTTP/2
+// in the TLS handshake. This verifies that WebSocket upgrade (HTTP/1.1) works correctly
+// even when HTTP/2 is available and preferred during TLS negotiation.
+func TestWebSocketMitmWithHTTP2(t *testing.T) {
+	// Start a WebSocket echo server with HTTP/2 support
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Log the protocol of the backend request
+		t.Logf("Backend received request with protocol: %s", r.Proto)
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		defer func() {
+			_ = c.Close(websocket.StatusNormalClosure, "")
+		}()
+
+		ctx := r.Context()
+		for {
+			mt, message, err := c.Read(ctx)
+			if err != nil {
+				break
+			}
+			err = c.Write(ctx, mt, append([]byte("ECHO: "), message...))
+			if err != nil {
+				break
+			}
+		}
+	}))
+	backend.EnableHTTP2 = true
+	backend.StartTLS()
+	defer backend.Close()
+
+	// Start goproxy with HTTP/2 support enabled and request logging
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.AllowHTTP2 = true
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		if strings.Contains(r.URL.Host, "websocket") || r.Header.Get("Upgrade") != "" {
+			t.Logf("Proxy received request with protocol: %s, Upgrade header: %s", r.Proto, r.Header.Get("Upgrade"))
+		}
+		return r, nil
+	})
+
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	// Configure WebSocket client to use proxy and attempt HTTP/2
+	proxyURL, err := url.Parse(proxyServer.URL)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	c, _, err := websocket.Dial(ctx, backend.URL, &websocket.DialOptions{
+		HTTPClient: &http.Client{
+			Transport: &http.Transport{
+				Proxy:             http.ProxyURL(proxyURL),
+				ForceAttemptHTTP2: true, // Attempt HTTP/2 during TLS negotiation
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+					NextProtos:         []string{"h2", "http/1.1"}, // Prefer HTTP/2, fall back to HTTP/1.1
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		_ = c.Close(websocket.StatusNormalClosure, "")
+	}()
+
+	// Verify bidirectional communication works despite HTTP/2 preference
+	message := []byte("Hello WebSocket over HTTP/2")
+	err = c.Write(ctx, websocket.MessageText, message)
+	require.NoError(t, err)
+
+	mt, response, err := c.Read(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, websocket.MessageText, mt)
+	assert.Equal(t, "ECHO: Hello WebSocket over HTTP/2", string(response))
+
+	// Verify multiple messages work
+	message2 := []byte("Second message")
+	err = c.Write(ctx, websocket.MessageText, message2)
+	require.NoError(t, err)
+
+	mt, response2, err := c.Read(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, websocket.MessageText, mt)
+	assert.Equal(t, "ECHO: Second message", string(response2))
+}
+
 // TestUTLSFingerprintActuallyForwarded verifies that the proxy actually uses uTLS
 // to replicate the client's TLS fingerprint when connecting to the backend.
 func TestUTLSFingerprintActuallyForwarded(t *testing.T) {
