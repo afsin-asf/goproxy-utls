@@ -3,6 +3,7 @@ package goproxy
 import (
 	"bufio"
 	"context"
+	cryptotls "crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -353,16 +354,16 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							}
 							defer backendConn.Close()
 
-							// For WebSockets, we MUST negotiate HTTP/1.1 only (no HTTP/2)
-							// Create a minimal TLS config that only offers HTTP/1.1
-							wsConfig := &tls.Config{
+							// For WebSockets, use standard Go crypto/tls which negotiates HTTP/1.1 only
+							// This avoids HTTP/2 negotiation issues that can occur with uTLS presets
+							wsConfig := &cryptotls.Config{
 								InsecureSkipVerify: true,
 								NextProtos:         []string{"http/1.1"},
 								ServerName:         host,
 							}
 							
-							// Use HelloCustom without any preset - this respects NextProtos from config
-							wsConn := tls.UClient(backendConn, wsConfig, tls.HelloCustom)
+							// Use standard Go TLS client for WebSocket (HTTP/1.1 guaranteed)
+							wsConn := cryptotls.Client(backendConn, wsConfig)
 							if err := wsConn.HandshakeContext(reqCtx.Req.Context()); err != nil {
 								reqCtx.Warnf("Failed to establish TLS connection for WebSocket: %v", err)
 								return false
